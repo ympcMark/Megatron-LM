@@ -141,6 +141,17 @@ def test_encoder_overlap_accepts_uniform_participation_opt_in():
     assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
 
 
+def test_language_rank_input_projection_accepts_llm_pp1():
+    args = _layout_8gpu_20l(input_projections_on_language_ranks=True)
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
+def test_language_rank_input_projection_rejects_llm_only():
+    args = _layout_8gpu_20l(input_projections_on_language_ranks=True, llm_only=True)
+    with pytest.raises(ValueError, match="cannot be used with --llm-only"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
 def test_llm_only_requires_offset_zero():
     args = _layout_8gpu_20l(llm_only=True, llm_offset=4)
     with pytest.raises(ValueError, match="--llm-only requires --llm-offset 0"):

@@ -381,18 +381,20 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
 
     for module_name, grid in grid_map.items():
-        is_active = grid.is_current_rank_in_grid()
-
         optimizer = None
         pg_collection = None
+        is_active = False
 
-        if is_active:
+        if grid.is_current_rank_in_grid():
             if module_name == lang_key:
                 module = mimo_model.language_model
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None:
+            if module is not None and any(
+                parameter.requires_grad for parameter in module.parameters()
+            ):
+                is_active = True
                 pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
                 assert (
                     pg_collection is not None
