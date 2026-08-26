@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -90,6 +91,37 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+@pytest.mark.parametrize(
+    "modules,expected",
+    [
+        pytest.param([], 1, id="whole-layer"),
+        pytest.param([CudaGraphModule.attn], 1, id="one-module"),
+        pytest.param(
+            [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+            1,
+            id="router-preprocess-is-one-scope",
+        ),
+        pytest.param([CudaGraphModule.mamba, CudaGraphModule.attn], 2, id="two-modules"),
+        pytest.param(
+            [
+                CudaGraphModule.mamba,
+                CudaGraphModule.attn,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            ],
+            2,
+            id="three-modules",
+        ),
+    ],
+)
+def test_gtp_persistent_buffer_max_inflight_follows_local_graph_scope(modules, expected):
+    runner = SimpleNamespace(
+        base_module=SimpleNamespace(config=SimpleNamespace(cuda_graph_modules=modules))
+    )
+
+    assert cuda_graphs_module._get_gtp_persistent_buffer_max_inflight([runner]) == expected
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
