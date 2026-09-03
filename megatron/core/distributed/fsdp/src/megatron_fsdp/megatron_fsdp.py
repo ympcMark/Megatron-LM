@@ -429,6 +429,24 @@ class MegatronFSDP(torch.nn.Module):
             device=self.device,
             reset_parameters_for_meta_device_init_module=self.init_model_with_meta_device,
         )
+        replicated_frozen_groups = [
+            group
+            for group in self.param_and_grad_buffer.parameter_groups
+            if group.replicated_frozen_params
+        ]
+        if replicated_frozen_groups:
+            replicated_frozen_bytes = sum(
+                group.model_weight_buffer.data.numel()
+                * group.model_weight_buffer.data.element_size()
+                for group in replicated_frozen_groups
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[Megatron-FSDP] Replicated frozen parameter groups: "
+                f"{len(replicated_frozen_groups)}, persistent local storage: "
+                f"{replicated_frozen_bytes / 1024**3:.3f} GiB",
+            )
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
         self.raw_param = dict(self.module.named_parameters())
 
@@ -472,6 +490,17 @@ class MegatronFSDP(torch.nn.Module):
 
         self.suggested_RS_queue_capacity = suggested_communication_unit_size
         self.suggested_AG_prefetch_size = suggested_communication_unit_size // 2
+
+        self.mid_layer_forward_prefetch_fsdp_units = max(
+            0,
+            int(
+                getattr(
+                    self.ddp_config,
+                    "megatron_fsdp_mid_layer_forward_prefetch_units",
+                    0,
+                )
+            ),
+        )
 
         # Only optim_grads_params shards model weights, so only those parameters are
         # released after use and have to be all-gathered before being accessed again.
@@ -580,6 +609,11 @@ class MegatronFSDP(torch.nn.Module):
         self.forward_hooks = {}
         self.backward_pre_hooks = {}
         self.grad_acc_hooks = {}
+        # Filled while lifecycle hooks are registered. The closure is invoked only
+        # after registration is complete, so it can use the finalized forward order.
+        forward_prefetch_modules = []
+        forward_prefetch_module_to_index = {}
+        forward_prefetch_representative_params = {}
 
         """
         An FSDP unit is a module designed to manage the lifecycle of model parameters
@@ -843,12 +877,39 @@ class MegatronFSDP(torch.nn.Module):
 
             param_list = _param_list_for_submodule_unshard(module, "forward")
 
+            # Mid-layer prefetch gathers only the current unit here. Following
+            # units are launched after the current unit's attention is enqueued.
+            mid_layer_prefetch = (
+                fsdp_forward_prefetch
+                and self.mid_layer_forward_prefetch_fsdp_units > 0
+                and module in forward_prefetch_module_to_index
+            )
+
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
                 params=param_list,
-                prefetch=fsdp_forward_prefetch,
+                prefetch=fsdp_forward_prefetch and not mid_layer_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
+            return None
+
+        @torch.compiler.disable
+        def _mid_layer_forward_prefetch(module: nn.Module, *unused):
+            """Launch future unit gathers after this unit's attention is enqueued."""
+            if module._training_state != TrainingState.FORWARD:
+                return None
+
+            current_index = forward_prefetch_module_to_index[module]
+            stop_index = min(
+                len(forward_prefetch_modules),
+                current_index + 1 + self.mid_layer_forward_prefetch_fsdp_units,
+            )
+            for target_module in forward_prefetch_modules[current_index + 1 : stop_index]:
+                self.all_gather_and_wait_parameters_ready(
+                    params=forward_prefetch_representative_params[target_module],
+                    prefetch=False,
+                    wait_bucket_ready=False,
+                )
             return None
 
         @torch.compiler.disable
@@ -1119,7 +1180,20 @@ class MegatronFSDP(torch.nn.Module):
         self.post_backward = _root_post_backward
 
         fsdp_modules = []
+        skipped_frozen_fsdp_units = 0
         for name, module in root_module.named_modules():
+            if (
+                getattr(self.ddp_config, "megatron_fsdp_replicate_frozen_params", False)
+                and isinstance(module, tuple(fsdp_unit_modules))
+            ):
+                module_params = list(module.parameters())
+                if module_params and not any(param.requires_grad for param in module_params):
+                    # This unit owns only persistent replicated parameters. Mark it
+                    # as handled so its children receive no FSDP lifecycle hooks.
+                    fsdp_modules.append(module)
+                    skipped_frozen_fsdp_units += 1
+                    continue
+
             # Set post backward hook for TE grouped gemm if enabled comm overlap
             setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
@@ -1136,6 +1210,8 @@ class MegatronFSDP(torch.nn.Module):
 
             if isinstance(module, tuple(fsdp_unit_modules)):
                 fsdp_modules.append(module)
+                forward_prefetch_module_to_index[module] = len(forward_prefetch_modules)
+                forward_prefetch_modules.append(module)
 
                 if any_sharding_strategy_in(self.ddp_config, ["optim_grads_params"]):
                     # Register the forward post-hook to reshard FSDP unit module parameters
@@ -1190,6 +1266,53 @@ class MegatronFSDP(torch.nn.Module):
                         )
                     )
                 )
+
+        if skipped_frozen_fsdp_units:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[Megatron-FSDP] Skipped parameter lifecycle hooks for "
+                f"{skipped_frozen_fsdp_units} fully frozen FSDP units.",
+            )
+
+        if self.mid_layer_forward_prefetch_fsdp_units > 0:
+            for module_index, module in enumerate(forward_prefetch_modules):
+                representative_params = []
+                seen_bucket_ids = set()
+                for param in module.parameters():
+                    bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                    param_group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                    if (
+                        param_group.model_weight_buffer.is_data_distributed
+                        and bucket_id not in seen_bucket_ids
+                    ):
+                        seen_bucket_ids.add(bucket_id)
+                        representative_params.append(param)
+                forward_prefetch_representative_params[module] = representative_params
+
+                attention_module = getattr(module, "self_attention", None)
+                if attention_module is None:
+                    raise ValueError(
+                        "Mid-layer Megatron-FSDP prefetch requires every forward "
+                        "FSDP unit to expose a self_attention module."
+                    )
+                self.forward_hooks[
+                    "mid-layer prefetch after "
+                    f"{type(module).__name__}[{module_index}] attention"
+                ] = attention_module.register_forward_hook(
+                    lambda _attention, _inputs, _output, owner=module: (
+                        _mid_layer_forward_prefetch(owner)
+                    ),
+                    prepend=False,
+                )
+
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[Megatron-FSDP] Mid-layer forward prefetch enabled: "
+                f"distance={self.mid_layer_forward_prefetch_fsdp_units}, "
+                f"units={len(forward_prefetch_modules)}.",
+            )
 
         # Register root module pre- and post-backward hooks in cases where the
         # forward function of root module is not called, but rather the forward
@@ -1350,25 +1473,42 @@ class MegatronFSDP(torch.nn.Module):
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
             if self.ddp_config.fsdp_all_gather_in_start_param_sync:
-                first_param = list(self.module.parameters())[0]
-                self.all_gather_and_wait_parameters_ready(
-                    params=[first_param], prefetch=True, wait_bucket_ready=False
+                first_sharded_param = next(
+                    (
+                        param
+                        for param in self.module.parameters()
+                        if self.param_and_grad_buffer.parameter_groups[
+                            self.param_and_grad_buffer.param_to_param_group[param]
+                        ].model_weight_buffer.is_data_distributed
+                    ),
+                    None,
                 )
+                if first_sharded_param is not None:
+                    self.all_gather_and_wait_parameters_ready(
+                        params=[first_sharded_param], prefetch=True, wait_bucket_ready=False
+                    )
         else:
             self.synchronize_param_gather()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
                 group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
+                if (
+                    group.model_weight_buffer is None
+                    or not group.model_weight_buffer.is_data_distributed
+                ):
                     continue
 
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
-                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
+                self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
+
+                # If model weight is sharded, wait for the all-gather to complete.
+                self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                if (
+                    group.model_weight_buffer is not None
+                    and group.model_weight_buffer.is_data_distributed
+                ):
+                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
     def start_grad_sync(self, *unused):
         """

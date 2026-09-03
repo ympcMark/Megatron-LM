@@ -67,6 +67,20 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
+    megatron_fsdp_replicate_frozen_params: bool = False
+    """Keep frozen parameters replicated across the Megatron-FSDP shard group.
+
+      This avoids parameter all-gathers and FSDP lifecycle hooks for fully frozen
+      FSDP units. Tensor-parallel sharding is preserved. This option currently
+      supports non-hybrid Megatron-FSDP only."""
+
+    megatron_fsdp_mid_layer_forward_prefetch_units: int = 0
+    """Prefetch subsequent forward FSDP units after self-attention.
+
+      A positive value replaces layer-entry byte-window prefetch with a targeted
+      asynchronous gather launched after the current TransformerLayer attention
+      call, allowing its queued compute to hide host and communication work."""
+
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 

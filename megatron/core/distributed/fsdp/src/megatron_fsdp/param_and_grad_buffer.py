@@ -1768,6 +1768,7 @@ class ParameterGroup:
     fsdp_unit_id: Optional[int] = None
     chunk_size_factor: int = 1
     sharding_strategy: Optional[str] = None
+    replicated_frozen_params: bool = False
     model_weight_buffer: Optional[DataParallelBuffer] = None
     transpose_weight_buffer: Optional[DataParallelBuffer] = None
     main_weight_buffer: Optional[DataParallelBuffer] = None
@@ -2549,6 +2550,15 @@ class ParamAndGradBuffer:
             self.dist_index.use_hybrid_fsdp
             and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
         )
+        replicate_frozen_params = getattr(
+            self.ddp_config, "megatron_fsdp_replicate_frozen_params", False
+        )
+        if replicate_frozen_params and should_create_hfsdp_helper_buffers:
+            raise NotImplementedError(
+                "Replicated frozen parameters currently support "
+                "non-hybrid Megatron-FSDP only."
+            )
+
         # DP-Outer sharding is only supported for fully-sharded DP-Shard. Every parameter
         # class has to qualify: the helper buffers re-index the DP-Shard layout, which is
         # only defined here for fully-sharded groups.
@@ -2651,6 +2661,15 @@ class ParamAndGradBuffer:
             is_main_weight_buffer_distributed = buffer_distribution.main_weight
             is_grad_buffer_distributed = buffer_distribution.grad
 
+            group.replicated_frozen_params = (
+                replicate_frozen_params
+                and group.requires_grad is False
+                and is_model_weight_buffer_distributed
+            )
+            group_model_weight_buffer_distributed = (
+                is_model_weight_buffer_distributed
+                and not group.replicated_frozen_params
+            )
             main_buf_extra_kwargs = {}
             if should_create_hfsdp_helper_buffers:
                 # DP-Outer + DP-Shard
@@ -2714,7 +2733,7 @@ class ParamAndGradBuffer:
                 group.model_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
-                    is_data_distributed=is_model_weight_buffer_distributed
+                    is_data_distributed=group_model_weight_buffer_distributed
                     and model_wbuf_dp_group.size() > 1,
                     dtype=param_dtype,
                     device=self.device,
@@ -2733,7 +2752,7 @@ class ParamAndGradBuffer:
                     group.transpose_weight_buffer = DataParallelBuffer(
                         self.ddp_config,
                         group.params,
-                        is_data_distributed=is_model_weight_buffer_distributed
+                        is_data_distributed=group_model_weight_buffer_distributed
                         and main_buf_dp_group.size() > 1,
                         dtype=param_dtype,
                         device=self.device,
@@ -3303,7 +3322,10 @@ class ParamAndGradBuffer:
                 # optimization, regardless whether the buffers are sharded or not.
                 # mbuf and wbuf won't exist in the case of "no_shard", in which case
                 # we simply take the original unsharded parameter weight from the model.
-                sharded_optimizer_state = pg.sharding_strategy != "no_shard"
+                sharded_optimizer_state = (
+                    pg.sharding_strategy != "no_shard"
+                    and not pg.replicated_frozen_params
+                )
 
                 # Register model training and high-precision parameters as DTensor(s).
                 if mbuf:
@@ -4409,7 +4431,12 @@ class AllGatherPipeline:
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
             for bwd in [False, True]:
-                self.bucket_status[self.get_bucket_key(i, bwd)] = BucketStatus.EMPTY
+                status = (
+                    BucketStatus.EMPTY
+                    if self.get_fsdp_buffer(i, bwd).is_data_distributed
+                    else BucketStatus.READY_TO_USE
+                )
+                self.bucket_status[self.get_bucket_key(i, bwd)] = status
 
         # Track whether each bucket can be deallocated.
         self.bucket_can_be_released = {}
@@ -4493,6 +4520,10 @@ class AllGatherPipeline:
             is_unit_bucket = group.fsdp_unit_id is not None and group.has_sharded_model_weights()
             for bwd in [False, True]:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
+                if not self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed:
+                    self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+                    self.bucket_can_be_released[bucket_key] = False
+                    continue
                 # If preserve_non_fsdp_units is set, then do not release buckets
                 # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
                 # (not NEW) so a later all-gather refreshes preserved non-unit bucket
@@ -4503,7 +4534,7 @@ class AllGatherPipeline:
                     self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
-        expected_statuses = (BucketStatus.EMPTY,)
+        expected_statuses = (BucketStatus.EMPTY, BucketStatus.READY_TO_USE)
         if preserve_non_fsdp_units:
             expected_statuses += (BucketStatus.PRESERVED,)
 
@@ -4697,6 +4728,13 @@ class AllGatherPipeline:
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         double_buf_units = set()
+        ag_buckets = [
+            bucket_id
+            for bucket_id in ag_buckets
+            if self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed
+        ]
+        if len(ag_buckets) == 0:
+            return
         if self.buffer.ddp_config.fsdp_double_buffer:
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
@@ -4745,6 +4783,14 @@ class AllGatherPipeline:
 
         if outer_ag_buckets:
             self._launch_outer_prefetches(outer_ag_buckets, bwd)
+
+        # A bucket group can contain a persistent, replicated frozen buffer. It
+        # participates in neither allocation nor parameter communication.
+        ag_buckets = [
+            bucket_id
+            for bucket_id in ag_buckets
+            if self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed
+        ]
 
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
@@ -4860,6 +4906,10 @@ class AllGatherPipeline:
             parameters are simultaneously modified or shared with other modules.
         """
         bucket_key = self.get_bucket_key(bucket_id, bwd)
+        if not self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed:
+            self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+            self.bucket_can_be_released[bucket_key] = False
+            return
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
             return
 
@@ -4908,6 +4958,11 @@ class AllGatherPipeline:
     def async_bucket_gather(self, bucket_id, bwd) -> None:
         """All-gather the bucket and set the items."""
         bucket_key = self.get_bucket_key(bucket_id, bwd)
+
+        if not self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed:
+            self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+            self.bucket_can_be_released[bucket_key] = False
+            return
 
         self.bucket_can_be_released[bucket_key] = False
         if self.bucket_status[bucket_key] in (
