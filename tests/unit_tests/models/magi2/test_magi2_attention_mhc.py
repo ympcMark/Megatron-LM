@@ -209,9 +209,11 @@ class TestMagi2AttentionMHC:
     def test_fourier_rope_matches_public_partial_width(self) -> None:
         config = _reduced_config()
         context = _runtime_context(config)
+        rope = context.rope
 
-        assert context.rope.shape == (6, 6)
-        assert torch.isfinite(context.rope).all()
+        assert rope is not None
+        assert rope.shape == (6, 6)
+        assert torch.isfinite(rope).all()
 
     def test_mhc_matches_official_formula_and_backward(self) -> None:
         config = _reduced_config(hidden_size=8, num_attention_heads=1, num_query_groups=1)

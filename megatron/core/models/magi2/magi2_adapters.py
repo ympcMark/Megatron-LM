@@ -10,6 +10,7 @@ from megatron.core.models.magi2.magi2_config import Magi2Config
 from megatron.core.models.magi2.magi2_modalities import Magi2MultiModalityRMSNorm
 from megatron.core.models.magi2.magi2_rope import Magi2FourierRoPE
 from megatron.core.models.magi2.magi2_runtime_context import Magi2Modality
+from megatron.core.transformer.module import mark_keep_in_fp32
 
 Magi2RMSNorm = Magi2MultiModalityRMSNorm
 
@@ -30,6 +31,10 @@ class Magi2PreAdapter(nn.Module):
         self.text_embedder = nn.Linear(
             config.magi2_text_in_channels, width, bias=True, dtype=torch.float32
         )
+        for projection in (self.video_embedder, self.audio_embedder, self.text_embedder):
+            mark_keep_in_fp32(projection.weight)
+            if projection.bias is not None:
+                mark_keep_in_fp32(projection.bias)
         self.rope = Magi2FourierRoPE(config.magi2_attention_head_dim)
 
     def forward(self, inputs: Tensor, modality_mapping: Tensor) -> Tensor:
@@ -83,6 +88,8 @@ class Magi2PostAdapter(nn.Module):
         self.final_linear_audio = nn.Linear(
             width, config.magi2_audio_in_channels, bias=False, dtype=torch.float32
         )
+        mark_keep_in_fp32(self.final_linear_video.weight)
+        mark_keep_in_fp32(self.final_linear_audio.weight)
 
     def forward(self, hidden_states: Tensor, modality_mapping: Tensor) -> Tensor:
         """Project video/audio tokens and leave text/time output rows at zero."""

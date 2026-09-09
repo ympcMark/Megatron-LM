@@ -23,7 +23,10 @@ from megatron.core.models.magi2 import (
     get_magi2_transformer_block_submodules,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -149,6 +152,32 @@ class TestMagi2ModelSkeleton:
         assert pre_adapter.video_embedder.weight.grad is not None
         assert post_adapter.final_linear_audio.weight.grad is not None
 
+    def test_adapters_preserve_official_fp32_boundary_under_mixed_precision(self) -> None:
+        config = _reduced_config(
+            params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16, bf16=True
+        )
+        pre_adapter = convert_module_to_dtype_except_fp32_marked(
+            Magi2PreAdapter(config), torch.bfloat16
+        )
+        post_adapter = convert_module_to_dtype_except_fp32_marked(
+            Magi2PostAdapter(config), torch.bfloat16
+        )
+        inputs = torch.randn(4, 5, dtype=torch.float32, requires_grad=True)
+        mapping = torch.tensor(
+            [Magi2Modality.VIDEO, Magi2Modality.AUDIO, Magi2Modality.TEXT, Magi2Modality.TIME]
+        )
+
+        hidden_states = pre_adapter(inputs, mapping)
+        output = post_adapter(hidden_states.to(torch.bfloat16), mapping)
+        output.square().mean().backward()
+
+        assert pre_adapter.video_embedder.weight.dtype == torch.float32
+        assert pre_adapter.text_embedder.bias.dtype == torch.float32
+        assert post_adapter.final_linear_audio.weight.dtype == torch.float32
+        assert hidden_states.dtype == torch.float32
+        assert output.dtype == torch.float32
+        assert inputs.grad is not None
+
     def test_runtime_context_uses_existing_packed_sequence_interface(self) -> None:
         coordinates = torch.zeros(4, 9)
         mapping = torch.tensor(
@@ -195,7 +224,7 @@ class TestMagi2ModelSkeleton:
 
     def test_mcore_package_has_no_bridge_dependency(self) -> None:
         package_path = Path(magi2_package.__file__).parent
-        imported_modules = []
+        imported_modules: list[str] = []
         for source_path in package_path.glob("*.py"):
             tree = ast.parse(source_path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):

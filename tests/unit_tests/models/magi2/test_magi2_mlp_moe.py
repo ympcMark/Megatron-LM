@@ -209,18 +209,17 @@ class TestMagi2Router:
         hidden_states = torch.randn(8, 1, 4, requires_grad=True)
         gate = torch.randn(10, 4, requires_grad=True)
         expert_bias = torch.linspace(-0.2, 0.2, 10)
-        kwargs = {
-            "num_heads": 2,
-            "num_experts_per_head": 5,
-            "top_k": 2,
-            "score_func": "sigmoid",
-            "route_norm": True,
-            "route_scale": 4.9,
-            "route_norm_eps": 1e-12,
-        }
-
         actual_probs, actual_map = multi_head_topk_routing(
-            hidden_states, gate, expert_bias, **kwargs
+            hidden_states,
+            gate,
+            expert_bias,
+            num_heads=2,
+            num_experts_per_head=5,
+            top_k=2,
+            score_func="sigmoid",
+            route_norm=True,
+            route_scale=4.9,
+            route_norm_eps=1e-12,
         )
         expected_probs, expected_map = _reference_route(
             hidden_states,
