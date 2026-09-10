@@ -9,6 +9,7 @@ from megatron.core.models.magi2.magi2_adapters import (
 from megatron.core.models.magi2.magi2_attention import (
     Magi2Attention,
     Magi2AttentionSubmodules,
+    Magi2DotProductAttention,
     Magi2TorchDotProductAttention,
 )
 from megatron.core.models.magi2.magi2_checkpoint import (
@@ -57,6 +58,7 @@ __all__ = [
     "Magi2DistributedMultiHeadMoE",
     "Magi2Attention",
     "Magi2AttentionSubmodules",
+    "Magi2DotProductAttention",
     "Magi2FourierRoPE",
     "Magi2LayerPlan",
     "Magi2MHCBranch",

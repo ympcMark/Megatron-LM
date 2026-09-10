@@ -8,11 +8,13 @@ import hashlib
 import pytest
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.magi2 import (
     Magi2Attention,
     Magi2AttentionSubmodules,
     Magi2Config,
+    Magi2DotProductAttention,
     Magi2FourierRoPE,
     Magi2MHCBranch,
     Magi2Modality,
@@ -334,7 +336,8 @@ class TestMagi2AttentionMHC:
             pg_collection=pg_collection,
         ).to(device)
         _fill_deterministically(reference)
-        for name in ("pre_norm", "q_norm", "k_norm", "linear_g", "linear_qkv", "linear_proj"):
+        projection_names = ("pre_norm", "q_norm", "k_norm", "linear_g", "linear_qkv", "linear_proj")
+        for name in projection_names:
             getattr(production, name).load_state_dict(getattr(reference, name).state_dict())
         production.core_attention.softmax_offset.data.copy_(
             reference.core_attention.softmax_offset.data
@@ -349,6 +352,53 @@ class TestMagi2AttentionMHC:
         actual.float().square().mean().backward()
         assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
         assert production.core_attention.softmax_offset.grad is not None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+    def test_mcore_dot_product_attention_adapter_forward_backward(self) -> None:
+        device = torch.device("cuda")
+        tensor_parallel.model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        config = _reduced_config(
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            bf16=True,
+            use_cpu_initialization=False,
+            attention_softmax_in_fp32=True,
+            masked_softmax_fusion=False,
+        )
+        context = _runtime_context(config, device)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(["tp", "cp"])
+        reference = Magi2Attention(
+            config,
+            Magi2AttentionSubmodules(core_attention=Magi2TorchDotProductAttention),
+            layer_number=1,
+            num_modalities=3,
+            pg_collection=pg_collection,
+        ).to(device)
+        production = Magi2Attention(
+            config,
+            Magi2AttentionSubmodules(core_attention=Magi2DotProductAttention),
+            layer_number=1,
+            num_modalities=3,
+            pg_collection=pg_collection,
+        ).to(device)
+        _fill_deterministically(reference)
+        projection_names = ("pre_norm", "q_norm", "k_norm", "linear_g", "linear_qkv", "linear_proj")
+        for name in projection_names:
+            getattr(production, name).load_state_dict(getattr(reference, name).state_dict())
+        production.core_attention.softmax_offset.data.copy_(
+            reference.core_attention.softmax_offset.data
+        )
+        original_hidden = torch.randn(6, 1, 16, device=device, dtype=torch.bfloat16)
+        hidden = context.get_modality_dispatcher().permute(original_hidden).requires_grad_(True)
+
+        expected = reference(hidden, None, context)
+        actual = production(hidden, None, context)
+
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=2e-2)
+        actual.float().square().mean().backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert production.core_attention.softmax_offset.grad is not None
+        assert torch.isfinite(production.core_attention.softmax_offset.grad).all()
 
     def test_real_attention_mhc_layer_runs_inside_transformer_block(self) -> None:
         config = _reduced_config()

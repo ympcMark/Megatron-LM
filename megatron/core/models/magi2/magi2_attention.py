@@ -16,6 +16,7 @@ from megatron.core.models.magi2.magi2_modalities import (
 from megatron.core.models.magi2.magi2_rope import apply_magi2_rotary_pos_emb
 from megatron.core.models.magi2.magi2_runtime_context import Magi2RuntimeContext
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -31,8 +32,9 @@ class Magi2AttentionSubmodules:
 class Magi2TorchDotProductAttention(MegatronModule):
     """Differentiable packed attention reference with a learnable sink per head.
 
-    This implementation is the numerical fallback and unit-test oracle path.
-    Production GPU specs use MCore's Transformer Engine dot-product attention.
+    This self-contained implementation is the unit-test oracle. Production
+    correctness specs use :class:`Magi2DotProductAttention` to share MCore's
+    generic attention implementation.
     """
 
     def __init__(
@@ -104,6 +106,78 @@ class Magi2TorchDotProductAttention(MegatronModule):
             denominator = exp_logits.sum(dim=-1, keepdim=True) + torch.exp(sink - max_logits)
             attended = torch.matmul(exp_logits / denominator, v_segment)
             outputs.append(attended.permute(2, 0, 1, 3).to(query.dtype))
+
+        output = torch.cat(outputs, dim=0)
+        if thd_input:
+            return output.squeeze(1)
+        return output.reshape(output.shape[0], output.shape[1], -1)
+
+
+class Magi2DotProductAttention(DotProductAttention):
+    """Packed-sequence adapter around MCore's native dot-product attention.
+
+    MCore's reference attention already implements MAGI-2's learnable sink
+    softmax, mixed-precision score calculation, dropout, and checkpoint
+    sharding. MAGI-2 only adds segmentation at the packed-sequence boundaries
+    because the generic implementation accepts one dense sequence at a time.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.attn_mask_type is not AttnMaskType.no_mask or self.attention_type != "self":
+            raise ValueError("MAGI-2 uses bidirectional self-attention without an explicit mask")
+        if self.softmax_offset is None:
+            raise ValueError("MAGI-2 requires a learnable attention sink")
+        self.softmax_offset.data = self.softmax_offset.data.float()
+        mark_keep_in_fp32(self.softmax_offset)
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        attn_mask_type: AttnMaskType | None = None,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: Magi2RuntimeContext | None = None,
+    ) -> Tensor:
+        """Run native MCore attention independently for each packed sequence."""
+        if attention_mask is not None or attention_bias is not None:
+            raise ValueError("MAGI-2 packed attention does not consume an external mask or bias")
+        if attn_mask_type not in (None, AttnMaskType.no_mask):
+            raise ValueError("MAGI-2 attention must use AttnMaskType.no_mask")
+        if packed_seq_params is None or packed_seq_params.cu_seqlens_q is None:
+            raise ValueError("MAGI-2 attention requires packed sequence boundaries")
+        if query.shape != key.shape or query.shape != value.shape or query.ndim not in (3, 4):
+            raise ValueError("query, key, and value must have matching THD or TBHD shapes")
+
+        thd_input = query.ndim == 3
+        if thd_input:
+            query = query.unsqueeze(1)
+            key = key.unsqueeze(1)
+            value = value.unsqueeze(1)
+
+        boundaries = tuple(int(item) for item in packed_seq_params.cu_seqlens_q.cpu().tolist())
+        outputs = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            output = super().forward(
+                query[start:end],
+                key[start:end],
+                value[start:end],
+                None,
+                attn_mask_type=AttnMaskType.no_mask,
+                attention_bias=None,
+                packed_seq_params=None,
+            )
+            outputs.append(
+                output.view(
+                    end - start,
+                    query.shape[1],
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                )
+            )
 
         output = torch.cat(outputs, dim=0)
         if thd_input:
