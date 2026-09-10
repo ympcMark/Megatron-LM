@@ -229,11 +229,39 @@ class TestMagi2OfficialParity:
         with pytest.raises(RuntimeError, match="unexpected source keys"):
             convert_magi2_official_state_dict(unknown_source, model)
 
+    def test_official_load_selects_ema_router_bias_by_default(self) -> None:
+        config = _config()
+        reference, model = _models(config)
+        source = dict(reference.state_dict())
+        prefix = "block.layers.1.mlp.moe_mlp.router.expert_bias"
+        source[prefix] = torch.full_like(source[prefix], -3.0)
+        source[prefix + "_ema"] = torch.linspace(
+            0.1, 0.6, source[prefix].numel(), device=source[prefix].device
+        )
+
+        load_magi2_official_state_dict(model, source)
+        router = model.decoder.layers[1].mlp.routed.router
+        torch.testing.assert_close(router.expert_bias, source[prefix + "_ema"])
+        torch.testing.assert_close(router.expert_bias_ema, source[prefix + "_ema"])
+
+        load_magi2_official_state_dict(model, source, router_bias_source="main")
+        torch.testing.assert_close(router.expert_bias, source[prefix])
+        torch.testing.assert_close(router.expert_bias_ema, source[prefix + "_ema"])
+
+        with pytest.raises(ValueError, match="router_bias_source"):
+            load_magi2_official_state_dict(model, source, router_bias_source="invalid")
+
     def test_single_file_safetensors_streaming_load(self) -> None:
         from safetensors.torch import save_file
 
         config = _config()
         reference, _ = _models(config)
+        router = reference.block.layers[1].mlp.moe_mlp.router
+        with torch.no_grad():
+            router.expert_bias.fill_(-2.0)
+            router.expert_bias_ema.copy_(
+                torch.linspace(0.2, 0.7, router.expert_bias_ema.numel(), device="cuda")
+            )
         checkpoint_dir = tempfile.mkdtemp(prefix="magi2_stage5_safe_", dir="/tmp")
         try:
             save_file(
@@ -255,9 +283,14 @@ class TestMagi2OfficialParity:
                 f"target_keys={len(report.populated_target_keys)} "
                 f"preserved_runtime_keys={len(report.preserved_target_keys)}"
             )
+            loaded_router = loaded_model.decoder.layers[1].mlp.routed.router
+            torch.testing.assert_close(loaded_router.expert_bias, router.expert_bias_ema)
+            torch.testing.assert_close(loaded_router.expert_bias_ema, router.expert_bias_ema)
 
             batch = _batch(torch.device("cuda"))
             inputs, coordinates, mapping, cu_seqlens, _, _ = batch
+            with torch.no_grad():
+                router.expert_bias.copy_(router.expert_bias_ema)
             expected = reference(inputs, coordinates, mapping, cu_seqlens)
             actual = loaded_model(inputs, coordinates, mapping, cu_seqlens)
             torch.testing.assert_close(actual, expected, rtol=7e-2, atol=3e-2)

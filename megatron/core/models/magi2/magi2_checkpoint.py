@@ -9,13 +9,14 @@ from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
 
 _LAYER_KEY = re.compile(r"^block\.layers\.(\d+)\.(.+)$")
 _EXPERT_WEIGHT_NAMES = ("W_gate", "W_up", "W_down")
+_EXPERT_READ_CHUNK_SIZE = 16
 _MHC_NAMES = {
     "mhc_alpha_pre_attn": "attention_mhc.alpha_pre",
     "mhc_alpha_post_attn": "attention_mhc.alpha_post",
@@ -285,8 +286,31 @@ def convert_magi2_official_state_dict(
     return converted, report
 
 
+def _apply_runtime_router_bias(
+    model: nn.Module, router_bias_source: Literal["ema", "main"]
+) -> None:
+    """Select the runtime router bias paired with the public checkpoint weights."""
+    if router_bias_source not in ("ema", "main"):
+        raise ValueError("router_bias_source must be 'ema' or 'main'")
+    if router_bias_source == "main":
+        return
+    buffers = dict(model.named_buffers())
+    with torch.no_grad():
+        for key, ema_bias in buffers.items():
+            if not key.endswith(".routed.router.expert_bias_ema"):
+                continue
+            main_key = key.removesuffix("_ema")
+            if main_key not in buffers:
+                raise KeyError(f"missing runtime router bias paired with {key}")
+            buffers[main_key].copy_(ema_bias)
+
+
 def load_magi2_official_state_dict(
-    model: nn.Module, official_state_dict: Mapping[str, Tensor], *, strict: bool = True
+    model: nn.Module,
+    official_state_dict: Mapping[str, Tensor],
+    *,
+    strict: bool = True,
+    router_bias_source: Literal["ema", "main"] = "ema",
 ) -> Magi2CheckpointConversionReport:
     """Convert and strictly load public MAGI-2 tensors into a native MCore model."""
     converted, report = convert_magi2_official_state_dict(official_state_dict, model, strict=strict)
@@ -296,6 +320,7 @@ def load_magi2_official_state_dict(
             "converted MAGI-2 state dict failed strict load: "
             f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
         )
+    _apply_runtime_router_bias(model, router_bias_source)
     return report
 
 
@@ -323,7 +348,11 @@ def _safetensors_weight_map(checkpoint_dir: str | Path) -> dict[str, Path]:
 
 
 def load_magi2_official_safetensors(
-    model: nn.Module, checkpoint_dir: str | Path, *, strict: bool = True
+    model: nn.Module,
+    checkpoint_dir: str | Path,
+    *,
+    strict: bool = True,
+    router_bias_source: Literal["ema", "main"] = "ema",
 ) -> Magi2CheckpointConversionReport:
     """Stream an official safetensors directory into a native MCore model.
 
@@ -363,9 +392,13 @@ def load_magi2_official_safetensors(
             raw_key, path = weight_map[source_key]
             return handles[path].get_tensor(raw_key)
 
-        def read_expert(source_key: str, global_index: int) -> Tensor:
+        def read_experts(source_key: str, global_indices: Sequence[int]) -> Tensor:
             raw_key, path = weight_map[source_key]
-            return handles[path].get_slice(raw_key)[global_index]
+            view = handles[path].get_slice(raw_key)
+            start = global_indices[0]
+            if tuple(global_indices) == tuple(range(start, start + len(global_indices))):
+                return view[start : start + len(global_indices)]
+            return torch.stack([view[index] for index in global_indices])
 
         with torch.no_grad():
             for source_key in report.consumed_source_keys:
@@ -387,20 +420,28 @@ def load_magi2_official_safetensors(
                 if gate_key not in weight_map:
                     continue
                 target_prefix = f"decoder.layers.{layer_index}.mlp.routed.experts."
-                for local_index, global_index in enumerate(global_expert_indices):
-                    fc1_key = target_prefix + f"linear_fc1.weight{local_index}"
-                    fc2_key = target_prefix + f"linear_fc2.weight{local_index}"
-                    gate = read_expert(gate_key, global_index)
-                    up = read_expert(up_key, global_index)
-                    down = read_expert(down_key, global_index)
-                    fc1 = torch.cat((gate.T, up.T))
-                    fc2 = down.T
-                    target_state[fc1_key].copy_(
-                        _target_value(fc1, target_state[fc1_key], gate_key, fc1_key)
-                    )
-                    target_state[fc2_key].copy_(
-                        _target_value(fc2, target_state[fc2_key], down_key, fc2_key)
-                    )
+                for local_start in range(0, len(global_expert_indices), _EXPERT_READ_CHUNK_SIZE):
+                    global_chunk = global_expert_indices[
+                        local_start : local_start + _EXPERT_READ_CHUNK_SIZE
+                    ]
+                    gate_chunk = read_experts(gate_key, global_chunk)
+                    up_chunk = read_experts(up_key, global_chunk)
+                    down_chunk = read_experts(down_key, global_chunk)
+                    for chunk_index, (gate, up, down) in enumerate(
+                        zip(gate_chunk, up_chunk, down_chunk)
+                    ):
+                        local_index = local_start + chunk_index
+                        fc1_key = target_prefix + f"linear_fc1.weight{local_index}"
+                        fc2_key = target_prefix + f"linear_fc2.weight{local_index}"
+                        fc1 = torch.cat((gate.T, up.T))
+                        fc2 = down.T
+                        target_state[fc1_key].copy_(
+                            _target_value(fc1, target_state[fc1_key], gate_key, fc1_key)
+                        )
+                        target_state[fc2_key].copy_(
+                            _target_value(fc2, target_state[fc2_key], down_key, fc2_key)
+                        )
+    _apply_runtime_router_bias(model, router_bias_source)
     return report
 
 
