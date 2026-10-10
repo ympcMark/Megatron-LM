@@ -12,6 +12,7 @@ from megatron.core.models.magi2.magi2_layer_specs import (
     get_magi2_transformer_block_submodules,
 )
 from megatron.core.models.magi2.magi2_runtime_context import Magi2RuntimeContext
+from megatron.core.models.magi2.magi2_transformer_layer import Magi2TransformerLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -63,6 +64,10 @@ class Magi2Model(MegatronModule):
         if len(input_tensor) != 1:
             raise ValueError("Magi2Model expects exactly one pipeline input tensor")
         self.decoder.set_input_tensor(input_tensor[0])
+
+    def get_fsdp_unit_modules(self) -> tuple[type[Magi2TransformerLayer], ...]:
+        """Return safe layer-level sharding units for Megatron FSDP."""
+        return (Magi2TransformerLayer,)
 
     def forward(
         self,

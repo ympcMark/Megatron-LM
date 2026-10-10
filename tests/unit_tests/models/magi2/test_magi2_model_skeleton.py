@@ -18,6 +18,7 @@ from megatron.core.models.magi2 import (
     Magi2PostAdapter,
     Magi2PreAdapter,
     Magi2RuntimeContext,
+    Magi2TransformerLayer,
     Magi2TransformerLayerSpecs,
     get_magi2_layer_plan,
     get_magi2_transformer_block_submodules,
@@ -221,6 +222,13 @@ class TestMagi2ModelSkeleton:
         # not incorrectly expand the already-2H residual stream a second time.
         assert model.pre_adapter is not None
         assert model.post_adapter is not None
+
+    def test_model_declares_layer_level_fsdp_units(self) -> None:
+        config = _reduced_config()
+        process_groups = ProcessGroupCollection.use_mpu_process_groups(["tp", "pp"])
+        model = Magi2Model(config, _test_layer_specs(), process_groups)
+
+        assert model.get_fsdp_unit_modules() == (Magi2TransformerLayer,)
 
     def test_mcore_package_has_no_bridge_dependency(self) -> None:
         package_path = Path(magi2_package.__file__).parent

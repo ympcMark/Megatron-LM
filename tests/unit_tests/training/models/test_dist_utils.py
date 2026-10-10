@@ -386,6 +386,34 @@ class TestDdpWrap:
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
+    def test_passes_model_declared_fsdp_unit_modules(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp, mock_fsdp, mock_torch_fsdp
+    ):
+        class CustomFSDPUnit(nn.Module):
+            pass
+
+        class CustomModel(nn.Module):
+            def get_fsdp_unit_modules(self):
+                return (CustomFSDPUnit,)
+
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        model = CustomModel()
+        _ddp_wrap(
+            [model], False, self.ddp_config, False, use_megatron_fsdp=True, pg_collection=self.pg
+        )
+
+        assert mock_fsdp.call_args.kwargs["fsdp_unit_modules"] == [CustomFSDPUnit]
+        mock_ddp.assert_not_called()
+        mock_torch_fsdp.assert_not_called()
+
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
     def test_uses_torch_fsdp2_when_flagged(
         self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp, mock_fsdp, mock_torch_fsdp
     ):

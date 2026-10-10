@@ -41,6 +41,29 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _get_model_fsdp_unit_modules(model_chunk: MegatronModule) -> list[type[torch.nn.Module]] | None:
+    """Return model-declared Megatron-FSDP unit module types.
+
+    Model families with custom TransformerBlock layers can expose a
+    ``get_fsdp_unit_modules`` method on their root module. Mixed-precision
+    wrapping happens before FSDP wrapping, so unwrap that transparent shell
+    before querying the model.
+    """
+    root_module = model_chunk.module if isinstance(model_chunk, Float16Module) else model_chunk
+    getter = getattr(type(root_module), "get_fsdp_unit_modules", None)
+    if getter is None:
+        return None
+    unit_modules = root_module.get_fsdp_unit_modules()
+    if not isinstance(unit_modules, (list, tuple)) or not unit_modules:
+        raise TypeError("get_fsdp_unit_modules must return a non-empty list or tuple")
+    if not all(
+        isinstance(module_type, type) and issubclass(module_type, torch.nn.Module)
+        for module_type in unit_modules
+    ):
+        raise TypeError("get_fsdp_unit_modules entries must be torch.nn.Module types")
+    return list(unit_modules)
+
+
 def unimodal_build_distributed_models(
     build_model_func: Callable,
     transformer_config: TransformerConfig,
@@ -392,6 +415,11 @@ def _ddp_wrap(
                         else pg_collection.expt_dp
                     ).size(),
                 )
+
+            if DP is FullyShardedDataParallel:
+                fsdp_unit_modules = _get_model_fsdp_unit_modules(model_chunk)
+                if fsdp_unit_modules is not None:
+                    chunk_kwargs["fsdp_unit_modules"] = fsdp_unit_modules
 
             wrapped_chunk = DP(
                 config=get_model_config(model_chunk),
