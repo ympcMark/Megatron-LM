@@ -77,7 +77,9 @@ class Magi2Model(MegatronModule):
         cu_seqlens: Tensor,
         attention_mask: Tensor | None = None,
         *,
+        cu_seqlens_padded: Tensor | None = None,
         cp_split_sizes: Tensor | None = None,
+        cp_global_indices: Tensor | None = None,
         time_token_sequence: Tensor | None = None,
         runtime_context: Magi2RuntimeContext | None = None,
     ) -> Tensor:
@@ -88,7 +90,9 @@ class Magi2Model(MegatronModule):
                 coordinates,
                 modality_mapping,
                 cu_seqlens,
+                cu_seqlens_padded=cu_seqlens_padded,
                 cp_split_sizes=cp_split_sizes,
+                cp_global_indices=cp_global_indices,
                 time_token_sequence=time_token_sequence,
             )
         else:

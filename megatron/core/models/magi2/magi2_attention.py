@@ -16,6 +16,7 @@ from megatron.core.models.magi2.magi2_modalities import (
 from megatron.core.models.magi2.magi2_rope import apply_magi2_rotary_pos_emb
 from megatron.core.models.magi2.magi2_runtime_context import Magi2RuntimeContext
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -185,6 +186,118 @@ class Magi2DotProductAttention(DotProductAttention):
         return output.reshape(output.shape[0], output.shape[1], -1)
 
 
+class Magi2ContextParallelDotProductAttention(MegatronModule):
+    """Correctness-first packed CP attention with the official learnable sink.
+
+    Transformer Engine currently has no backend for context parallelism with
+    learnable softmax offsets. This implementation reuses MCore's autograd-aware
+    first-dimension gather (reduce-scatter in backward), restores the global THD
+    order, and computes attention only for the queries owned by this CP rank.
+    """
+
+    def __init__(
+        self,
+        config: Magi2Config,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: float | None = None,
+        softmax_scale: float | None = None,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+    ) -> None:
+        super().__init__(config=config)
+        del layer_number
+        if attn_mask_type is not AttnMaskType.no_mask or attention_type != "self":
+            raise ValueError("MAGI-2 uses bidirectional self-attention without an explicit mask")
+        if (
+            attention_dropout if attention_dropout is not None else config.attention_dropout
+        ) != 0.0:
+            raise ValueError("the MAGI-2 Preview attention dropout must be zero")
+        if config.context_parallel_size <= 1:
+            raise ValueError("context-parallel MAGI-2 attention requires CP size greater than one")
+        if cp_comm_type != "all_gather":
+            raise ValueError("MAGI-2 learnable sinks currently require cp_comm_type='all_gather'")
+        if pg_collection is None or pg_collection.cp is None:
+            raise ValueError("context-parallel MAGI-2 attention requires an explicit CP group")
+
+        self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.magi2_attention_head_dim
+        self.softmax_scale = softmax_scale or self.head_dim**-0.5
+        self.softmax_offset = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        mark_keep_in_fp32(self.softmax_offset)
+
+    def _gather_global_tokens(self, tensor: Tensor, indices: Tensor) -> Tensor:
+        gathered = gather_from_sequence_parallel_region(
+            tensor, tensor_parallel_output_grad=True, group=self.cp_group
+        )
+        gathered_indices = [torch.empty_like(indices) for _ in range(self.cp_group.size())]
+        torch.distributed.all_gather(gathered_indices, indices, group=self.cp_group)
+        restore_order = torch.argsort(torch.cat(gathered_indices))
+        return gathered.index_select(0, restore_order)
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        attn_mask_type: AttnMaskType | None = None,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: Magi2RuntimeContext | None = None,
+    ) -> Tensor:
+        """Gather K/V and evaluate packed sink attention for local queries."""
+        if attention_mask is not None or attention_bias is not None:
+            raise ValueError("MAGI-2 packed attention does not consume an external mask or bias")
+        if attn_mask_type not in (None, AttnMaskType.no_mask):
+            raise ValueError("MAGI-2 attention must use AttnMaskType.no_mask")
+        if packed_seq_params is None or packed_seq_params.cp_global_indices is None:
+            raise ValueError("context-parallel MAGI-2 attention requires global token indices")
+        if query.shape != key.shape or query.shape != value.shape or query.ndim != 3:
+            raise ValueError("query, key, and value must have matching THD shapes")
+
+        local_indices = packed_seq_params.cp_global_indices
+        global_key = self._gather_global_tokens(key, local_indices)
+        global_value = self._gather_global_tokens(value, local_indices)
+        logical_boundaries = tuple(
+            int(item) for item in packed_seq_params.cu_seqlens_q.cpu().tolist()
+        )
+        physical_boundaries_tensor = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        physical_boundaries = tuple(int(item) for item in physical_boundaries_tensor.cpu().tolist())
+
+        output = torch.zeros_like(query)
+        sink = self.softmax_offset.view(self.num_heads, 1, 1)
+        for sequence_index, (logical_start, logical_end) in enumerate(
+            zip(logical_boundaries[:-1], logical_boundaries[1:])
+        ):
+            physical_start = physical_boundaries[sequence_index]
+            logical_length = logical_end - logical_start
+            physical_end = physical_start + logical_length
+            local_rows = torch.nonzero(
+                (local_indices >= physical_start) & (local_indices < physical_end), as_tuple=False
+            ).flatten()
+            if local_rows.numel() == 0:
+                continue
+
+            q_segment = query.index_select(0, local_rows).permute(1, 0, 2).float()
+            k_segment = global_key[physical_start:physical_end].permute(1, 0, 2).float()
+            v_segment = global_value[physical_start:physical_end].permute(1, 0, 2).float()
+            logits = torch.matmul(q_segment, k_segment.transpose(-1, -2)) * self.softmax_scale
+            max_logits = torch.maximum(logits.amax(dim=-1, keepdim=True), sink)
+            exp_logits = torch.exp(logits - max_logits)
+            denominator = exp_logits.sum(dim=-1, keepdim=True) + torch.exp(sink - max_logits)
+            attended = torch.matmul(exp_logits / denominator, v_segment)
+            output = output.index_copy(0, local_rows, attended.permute(1, 0, 2).to(query.dtype))
+        return output
+
+
 class Magi2Attention(MegatronModule):
     """Official MAGI-2 attention projections around an MCore attention kernel."""
 
@@ -234,6 +347,9 @@ class Magi2Attention(MegatronModule):
         self.linear_proj = Magi2ModalityLinear(
             self.hidden_size, self.hidden_size, bias=False, **linear_kwargs
         )
+        cp_comm_type = config.cp_comm_type
+        if isinstance(cp_comm_type, list):
+            cp_comm_type = cp_comm_type[layer_number - 1]
         self.core_attention = build_module(
             submodules.core_attention,
             config=config,
@@ -242,7 +358,7 @@ class Magi2Attention(MegatronModule):
             attention_type="self",
             attention_dropout=config.attention_dropout,
             softmax_scale=config.softmax_scale,
-            cp_comm_type=None,
+            cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
         )
 

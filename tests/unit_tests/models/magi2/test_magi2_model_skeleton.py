@@ -120,6 +120,8 @@ class TestMagi2ModelSkeleton:
             _reduced_config(enable_mhc_connections=True)
         with pytest.raises(ValueError, match="every MAGI-2 layer"):
             _reduced_config(magi2_moe_layers=())
+        with pytest.raises(ValueError, match="learnable attention sinks"):
+            _reduced_config(context_parallel_size=2, cp_comm_type="p2p")
 
     def test_layer_plan_and_transformer_block_specs_are_owned_by_mcore(self) -> None:
         config = _reduced_config()
@@ -192,6 +194,26 @@ class TestMagi2ModelSkeleton:
         assert context.max_seqlen_q == 2
         assert context.total_tokens == 4
         assert context.model_modality_mapping.tolist() == [0, 2, 2, 1]
+
+    def test_runtime_context_accepts_global_padded_boundaries_for_cp_shards(self) -> None:
+        config = _reduced_config(context_parallel_size=2, cp_comm_type="all_gather")
+        coordinates = torch.zeros(4, 9)
+        mapping = torch.tensor(
+            [Magi2Modality.VIDEO, Magi2Modality.AUDIO, Magi2Modality.TEXT, Magi2Modality.TEXT]
+        )
+        context = Magi2RuntimeContext.from_tensors(
+            coordinates,
+            mapping,
+            torch.tensor([0, 6], dtype=torch.int32),
+            cu_seqlens_padded=torch.tensor([0, 8], dtype=torch.int32),
+            cp_split_sizes=torch.tensor([4, 4], dtype=torch.int32),
+            cp_global_indices=torch.tensor([0, 1, 7, 6], dtype=torch.long),
+        )
+
+        assert config.context_parallel_size == 2
+        assert context.total_tokens == 8
+        assert context.max_seqlen_q == 6
+        assert context.cu_seqlens_q_padded.tolist() == [0, 8]
 
     def test_model_assembles_adapters_and_mcore_transformer_block(self) -> None:
         config = _reduced_config()

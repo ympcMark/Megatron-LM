@@ -140,8 +140,15 @@ class Magi2Config(TransformerConfig):
             raise ValueError("MAGI-2 tensor parallelism is not implemented yet")
         if self.pipeline_model_parallel_size != 1:
             raise ValueError("MAGI-2 pipeline parallelism is not implemented yet")
-        if self.context_parallel_size != 1:
-            raise ValueError("MAGI-2 context parallelism is not implemented yet")
+        if self.context_parallel_size > 1:
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if any(cp_comm_type != "all_gather" for cp_comm_type in cp_comm_types):
+                raise ValueError(
+                    "MAGI-2 learnable attention sinks currently require "
+                    "cp_comm_type='all_gather'"
+                )
         if self.sequence_parallel:
             raise ValueError("MAGI-2 sequence parallelism requires tensor parallelism support")
 

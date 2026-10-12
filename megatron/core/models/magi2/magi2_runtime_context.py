@@ -35,6 +35,7 @@ class Magi2RuntimeContext(PackedSeqParams):
     coordinates: Tensor | None = None
     modality_mapping: Tensor | None = None
     cp_split_sizes: Tensor | None = None
+    cp_global_indices: Tensor | None = None
     time_token_sequence: Tensor | None = None
     rope: Tensor | None = None
     _modality_dispatcher: Magi2ModalityDispatcher | None = field(
@@ -54,7 +55,9 @@ class Magi2RuntimeContext(PackedSeqParams):
         modality_mapping: Tensor,
         cu_seqlens: Tensor,
         *,
+        cu_seqlens_padded: Tensor | None = None,
         cp_split_sizes: Tensor | None = None,
+        cp_global_indices: Tensor | None = None,
         time_token_sequence: Tensor | None = None,
     ) -> "Magi2RuntimeContext":
         """Construct runtime metadata for a packed self-attention batch."""
@@ -64,16 +67,28 @@ class Magi2RuntimeContext(PackedSeqParams):
         if torch.any(sequence_lengths < 0):
             raise ValueError("cu_seqlens must be monotonically non-decreasing")
         max_sequence_length = int(sequence_lengths.max().item())
+        if cu_seqlens_padded is not None:
+            if cu_seqlens_padded.shape != cu_seqlens.shape:
+                raise ValueError("cu_seqlens_padded must match cu_seqlens")
+            padded_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+            if torch.any(padded_lengths < sequence_lengths):
+                raise ValueError("padded sequence lengths must cover logical sequence lengths")
+            total_tokens = int(cu_seqlens_padded[-1].item())
+        else:
+            total_tokens = int(cu_seqlens[-1].item())
         context = cls(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=max_sequence_length,
             max_seqlen_kv=max_sequence_length,
-            total_tokens=int(modality_mapping.numel()),
+            total_tokens=total_tokens,
             coordinates=coordinates,
             modality_mapping=modality_mapping,
             cp_split_sizes=cp_split_sizes,
+            cp_global_indices=cp_global_indices,
             time_token_sequence=time_token_sequence,
         )
         context.validate(modality_mapping.numel())
@@ -95,8 +110,29 @@ class Magi2RuntimeContext(PackedSeqParams):
             raise ValueError("cu_seqlens_q must be one-dimensional")
         if self.cu_seqlens_q[0].item() != 0:
             raise ValueError("cu_seqlens must start at zero")
-        if self.cu_seqlens_q[-1].item() != token_count:
-            raise ValueError("cu_seqlens must end at the packed token count")
+        physical_cu_seqlens = (
+            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
+        )
+        if physical_cu_seqlens.ndim != 1 or physical_cu_seqlens.shape != self.cu_seqlens_q.shape:
+            raise ValueError("padded sequence boundaries must match logical sequence boundaries")
+        global_token_count = int(physical_cu_seqlens[-1].item())
+        if self.cp_split_sizes is None:
+            if global_token_count != token_count:
+                raise ValueError("cu_seqlens must end at the packed token count")
+        else:
+            if self.cp_split_sizes.ndim != 1 or torch.any(self.cp_split_sizes <= 0):
+                raise ValueError("cp_split_sizes must contain one positive size per CP rank")
+            if int(self.cp_split_sizes.sum().item()) != global_token_count:
+                raise ValueError("cp_split_sizes must sum to the padded packed token count")
+            if not torch.any(self.cp_split_sizes == token_count):
+                raise ValueError("local packed token count is absent from cp_split_sizes")
+            if self.cp_global_indices is None or self.cp_global_indices.shape != (token_count,):
+                raise ValueError("cp_global_indices must contain one index per local token")
+            if (
+                self.cp_global_indices.min().item() < 0
+                or self.cp_global_indices.max().item() >= global_token_count
+            ):
+                raise ValueError("cp_global_indices contains an out-of-range global token index")
 
     @property
     def model_modality_mapping(self) -> Tensor:
