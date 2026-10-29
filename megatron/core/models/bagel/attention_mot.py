@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 from .alignment_audit import audit_compact_tensor, layer_alignment_audit_enabled
 from .bagel_rope import apply_qwen2_rotary_pos_emb
 from .mot_packed_seq_params import MoTPackedSeqParams
-from .mot_utils import attach_zero_grad_dependency
+from .mot_utils import attach_zero_grad_dependency, get_mot_local_seqlens
 
 
 @dataclass
@@ -339,11 +339,10 @@ class SelfAttentionMoT(MegatronModule):
         assert (
             packed_seq_params is not None
         ), "packed_seq_params must be provided for MoT with packed sequence"
-        Lund = getattr(packed_seq_params, 'padded_und_seqlen', 0)
-        Lgen = getattr(packed_seq_params, 'padded_gen_seqlen', 0)
+        local_Lund, local_Lgen = get_mot_local_seqlens(packed_seq_params, self.config)
         assert (
-            Lund + Lgen == seq_len
-        ), f"MoT branch lengths ({Lund} + {Lgen}) must match sequence length {seq_len}"
+            local_Lund + local_Lgen == seq_len
+        ), f"MoT branch lengths ({local_Lund} + {local_Lgen}) must match sequence length {seq_len}"
         # Keep the opt-in audit inert for lightweight helper-only test doubles.
         # Fully constructed attention modules always carry a 1-based layer number.
         alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))
@@ -357,8 +356,8 @@ class SelfAttentionMoT(MegatronModule):
 
         # Process understanding tokens. Empty branches must not enter tensor-parallel
         # modules, but their parameters still need explicit zero gradients.
-        und_hidden = hidden_states_flat[:Lund]
-        if Lund > 0:
+        und_hidden = hidden_states_flat[:local_Lund]
+        if local_Lund > 0:
             und_qkv, _ = self.linear_qkv(und_hidden)
         else:
             und_qkv = und_hidden.new_empty((0, self.linear_qkv_out_dim_per_partition))
@@ -368,7 +367,7 @@ class SelfAttentionMoT(MegatronModule):
             und_qkv = und_qkv.detach()
 
         # Process generation tokens
-        gen_hidden = hidden_states_flat[Lund:]
+        gen_hidden = hidden_states_flat[local_Lund:]
         if self.linear_qkv_gen is None:
             raise ValueError("linear_qkv_gen is None")
         if gen_hidden.shape[0] > 0:
@@ -378,10 +377,12 @@ class SelfAttentionMoT(MegatronModule):
             gen_qkv = attach_zero_grad_dependency(gen_qkv, self.linear_qkv_gen)
 
         qkv_output_flat = torch.cat((und_qkv, gen_qkv), dim=0)
+        Lund = getattr(packed_seq_params, 'padded_und_seqlen', 0)
+        Lgen = getattr(packed_seq_params, 'padded_gen_seqlen', 0)
 
         # Reshape back
         qkv_output = qkv_output_flat.view(
-            seq_len, batch_size, self.linear_qkv_out_dim_per_partition
+            Lund + Lgen, batch_size, self.linear_qkv_out_dim_per_partition
         )
 
         # =====================================================================
@@ -484,7 +485,7 @@ class SelfAttentionMoT(MegatronModule):
             audit_compact_tensor(
                 "attention.o_proj",
                 output[0] if isinstance(output, tuple) else output,
-                Lund,
+                local_Lund,
                 layer_number=self.layer_number,
             )
 
@@ -687,7 +688,7 @@ class SelfAttentionMoT(MegatronModule):
         output_flat = torch.cat((und_output, gen_output), dim=0)
 
         # Reshape back
-        output = output_flat.view(seq_len, batch_size, self.config.hidden_size)
+        output = output_flat.view(output_flat.shape[0], batch_size, self.config.hidden_size)
 
         return output, None
 

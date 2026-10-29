@@ -41,7 +41,7 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, get_pg_rank, get_pg_size, make_viewless_tensor
 
 from .attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
-from .mot_utils import attach_zero_grad_dependency
+from .mot_utils import attach_zero_grad_dependency, get_mot_local_seqlens
 from .transformer_mot_layer import MoTTransformerLayer, MoTTransformerLayerSubmodules
 
 try:
@@ -567,7 +567,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         assert (
             packed_seq_params is not None and packed_seq_params.padded_und_seqlen is not None
         ), "MoTPackedSeqParams with padded_und_seqlen is required"
-        Lund = packed_seq_params.padded_und_seqlen
+        Lund, _ = get_mot_local_seqlens(packed_seq_params, self.config)
         und_slice = hidden_states[:Lund]
         gen_slice = hidden_states[Lund:]
 

@@ -2,9 +2,22 @@
 
 """Shared helpers for Mixture-of-Transformers branch execution."""
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from torch import Tensor, nn
+
+
+def get_mot_local_seqlens(packed_seq_params, config) -> Tuple[int, int]:
+    """Return the UND/GEN lengths held by one sequence-parallel rank."""
+    tp_size = config.tensor_model_parallel_size if config.sequence_parallel else 1
+    und_seqlen = packed_seq_params.padded_und_seqlen
+    gen_seqlen = packed_seq_params.padded_gen_seqlen
+    if und_seqlen % tp_size or gen_seqlen % tp_size:
+        raise ValueError(
+            "BAGEL MoT branch lengths must be divisible by the tensor-parallel size "
+            "when sequence parallelism is enabled"
+        )
+    return und_seqlen // tp_size, gen_seqlen // tp_size
 
 
 def attach_zero_grad_dependency(output: Tensor, *modules: Optional[nn.Module]) -> Tensor:

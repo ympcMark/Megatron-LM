@@ -39,7 +39,7 @@ from .alignment_audit import (
     layer_alignment_audit_enabled,
 )
 from .mot_streams import mot_overlap_region
-from .mot_utils import attach_zero_grad_dependency
+from .mot_utils import attach_zero_grad_dependency, get_mot_local_seqlens
 
 # Import flex_attention for BlockMask support
 try:
@@ -378,7 +378,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Reads Lund/Lgen from packed_seq_params; no scatter-gather or index arrays.
         """
         assert packed_seq_params is not None, "packed_seq_params required for MoT training"
-        Lund = packed_seq_params.padded_und_seqlen
+        Lund, _ = get_mot_local_seqlens(packed_seq_params, self.config)
         # Keep the opt-in audit inert for lightweight helper-only test doubles.
         # Fully constructed transformer layers always carry a 1-based layer number.
         alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))

@@ -14,9 +14,14 @@ from megatron.core.models.bagel.alignment_audit import (
 from megatron.core.models.bagel.hf_bagel_llm import BagelLLMHuggingFaceModel
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
+from megatron.core.models.bagel.mot_utils import get_mot_local_seqlens
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +51,8 @@ class _AllGatherImageEmbeddings(torch.autograd.Function):
     Forward: concatenates each rank's local embeddings [V_r, H] into the full
     tensor [V, H] = cat([V_0, V_1, ..., V_{cp-1}], dim=0).
 
-    Backward: all ranks already hold the full grad_output [V, H] (it flows
-    back through the autograd graph to every rank identically), so rank r
-    recovers its local gradient by a purely local slice — no communication.
+    Backward: sums the CP-local contributions to the full grad_output [V, H],
+    then rank r recovers the gradient for its local ViT output slice.
     """
 
     @staticmethod
@@ -83,8 +87,8 @@ class _AllGatherImageEmbeddings(torch.autograd.Function):
         all_sizes = ctx.all_sizes
         cp_rank = dist.get_rank(ctx.group)
 
-        # No communication required: every rank already holds the full
-        # grad_output.  Rank r just extracts its own slice.
+        grad_output = grad_output.contiguous()
+        dist.all_reduce(grad_output, group=ctx.group)
         offset = sum(all_sizes[:cp_rank])
         return grad_output[offset : offset + all_sizes[cp_rank]].contiguous(), None, None
 
@@ -197,18 +201,20 @@ def align_bagel_embeddings(
     Lgen = packed_seq_params.padded_gen_seqlen
 
     # Step 3: compact [S, H] → [Lund+Lgen, 1, H]
-    decoder_input = torch.cat(
-        [
-            gather_pad_to_length(packed_seq, und_idx, Lund),
-            gather_pad_to_length(packed_seq, gen_idx, Lgen),
-        ],
-        dim=0,
-    ).unsqueeze(
-        1
-    )  # [Lund+Lgen, 1, H]
+    und_input = gather_pad_to_length(packed_seq, und_idx, Lund).unsqueeze(1)
+    gen_input = gather_pad_to_length(packed_seq, gen_idx, Lgen).unsqueeze(1)
+    if language_model.config.sequence_parallel:
+        und_input = scatter_to_sequence_parallel_region(
+            und_input, group=language_model.pg_collection.tp
+        )
+        gen_input = scatter_to_sequence_parallel_region(
+            gen_input, group=language_model.pg_collection.tp
+        )
+    decoder_input = torch.cat((und_input, gen_input), dim=0)
 
     if layer_alignment_audit_enabled(1):
-        audit_compact_tensor("decoder_input", decoder_input, Lund, layer_number=1)
+        local_Lund, _ = get_mot_local_seqlens(packed_seq_params, language_model.config)
+        audit_compact_tensor("decoder_input", decoder_input, local_Lund, layer_number=1)
 
     return dict(decoder_input=decoder_input)
 
@@ -447,17 +453,14 @@ class BagelMimoModel(MimoModel):
                         # All embeddings are now in the format [num_tokens, hidden_dim]
                         modality_embeddings[modality_name] = embeddings
                         if modality_name == "images":
-                            # BAGEL batches have few ViT images, and FlexAttention cannot
-                            # accept an empty input. Keep ViT input replicated on each rank
-                            # instead of sharding by image batch size.
-                            # if self.cp_size > 1:
-                            #     embeddings = all_gather_image_embeddings(
-                            #         embeddings,
-                            #         vit_tokens_encoded_per_cp=(
-                            #             packed_seq_params.vit_tokens_encoded_per_cp
-                            #         ),
-                            #         group=self.cp_group,
-                            #     )
+                            if self.cp_size > 1 and packed_seq_params.vit_tokens_encoded_per_cp:
+                                embeddings = all_gather_image_embeddings(
+                                    embeddings,
+                                    vit_tokens_encoded_per_cp=(
+                                        packed_seq_params.vit_tokens_encoded_per_cp
+                                    ),
+                                    group=self.cp_group,
+                                )
                             vision_embeddings = embeddings
                         if modality_name == "diffusion":
                             visual_latents = embeddings
@@ -527,10 +530,16 @@ class BagelMimoModel(MimoModel):
             # Only the last PP stage owns the diffusion output projection (llm2vae)
             # and computes the MSE loss; middle stages skip both.
             if self.post_process:
-                Lund = packed_seq_params.padded_und_seqlen
+                local_Lund, _ = get_mot_local_seqlens(packed_seq_params, self.language_model.config)
                 hidden_state = lm_output['last_hidden_state']  # [U+G,H]
                 vis_gen_target = vis_gen_target.to(hidden_state.device)
-                gen_hidden_state = hidden_state[Lund:]  # [G, H]
+                gen_hidden_state = hidden_state[local_Lund:]  # [G/tp, H]
+                if self.language_model.config.sequence_parallel:
+                    gen_hidden_state = gather_from_sequence_parallel_region(
+                        gen_hidden_state,
+                        tensor_parallel_output_grad=False,
+                        group=self.pg_collection.tp,
+                    )
                 # Native BAGEL runs the complete model forward inside BF16
                 # autocast.  In current PyTorch, autocast promotes ``pow`` in
                 # the squared error to FP32; evaluating this expression

@@ -21,6 +21,7 @@ from megatron.core.models.bagel.alignment_audit import (
 )
 from megatron.core.models.bagel.bagel_rope import BagelRotaryEmbedding
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
+from megatron.core.models.bagel.mot_utils import get_mot_local_seqlens
 from megatron.core.models.bagel.transformer_mot_block import (
     MoTTransformerLayerSubmodules,
     TransformerMoTBlock,
@@ -29,6 +30,7 @@ from megatron.core.models.bagel.transformer_mot_block import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +53,16 @@ class BagelMCoreModel(GPTModel):
             llm_config: Bagel LLM config (Qwen2Config) for additional settings
             *args, **kwargs: Arguments passed to GPTModel
         """
-        # kwargs['share_embeddings_and_output_weights'] = True
+        # BAGEL sequence-shards compact UND/GEN streams only after all modalities align.
+        kwargs['scatter_embedding_sequence_parallel'] = False
         super().__init__(*args, **kwargs)
         # self.share_embeddings_and_output_weights = True
 
         self.llm_config = llm_config
         self.num_heads = kwargs.get('config').num_attention_heads if 'config' in kwargs else 28
+        if self.post_process and self.config.sequence_parallel:
+            # The sparse UND states are explicitly gathered before the LM head.
+            self.output_layer.sequence_parallel = False
 
         # use bagel rope
         self.bagel_native_rope_for_alignment = getattr(
@@ -288,9 +294,15 @@ class BagelMCoreModel(GPTModel):
         # CE contributes 0 to loss but the effective LM-head weight is still in the graph.
         # Return raw per-token CE here. The training loss function applies
         # ce_loss_weights only when --ce-loss-reweighting is enabled, matching HF BAGEL.
+        local_Lund, _ = get_mot_local_seqlens(packed_seq_params, self.config)
+        und_hidden_states = last_hidden_state[:local_Lund]
+        if self.config.sequence_parallel:
+            und_hidden_states = gather_from_sequence_parallel_region(
+                und_hidden_states, tensor_parallel_output_grad=False, group=self.pg_collection.tp
+            )
         actual_Lund = len(packed_seq_params.local_und_token_indexes)
         mask = loss_mask > 0
-        logits_hidden_states = last_hidden_state[:actual_Lund][mask]
+        logits_hidden_states = und_hidden_states[:actual_Lund][mask]
         # Keep the LM head on the standard GPTModel path so MCore FSDP/TP
         # hooks observe it and its FP32 main-weight initialization.
         output_weight = None
@@ -371,6 +383,7 @@ class BagelMCoreModel(GPTModel):
             # packed_seq_params carries all index arrays and CP shard info.
             Lund = packed_seq_params.padded_und_seqlen
             Lgen = packed_seq_params.padded_gen_seqlen
+            local_Lund, local_Lgen = get_mot_local_seqlens(packed_seq_params, self.config)
             local_und_idx = packed_seq_params.local_und_token_indexes
             local_gen_idx = packed_seq_params.local_gen_token_indexes
 
@@ -381,8 +394,8 @@ class BagelMCoreModel(GPTModel):
             # arrives via set_input_tensor inside TransformerMoTBlock; skip the
             # shape check there.
             if decoder_input is not None:
-                assert decoder_input.shape[0] == Lund + Lgen, (
-                    f"decoder_input shape mismatch, expected {Lund + Lgen}, "
+                assert decoder_input.shape[0] == local_Lund + local_Lgen, (
+                    f"decoder_input shape mismatch, expected {local_Lund + local_Lgen}, "
                     f"got {decoder_input.shape[0]}"
                 )
 
